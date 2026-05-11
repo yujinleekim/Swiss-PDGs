@@ -1,0 +1,431 @@
+"""
+ffor_optimizer.py
+─────────────────
+OPF-based FFOR computation using Gurobi.
+
+Implements the iterative direction-scanning algorithm from the paper
+(Section II-C) for:
+  - Single-timestep FFOR  (paper eq. 5)
+  - Multi-timestep  FFOR  (paper eq. 6)
+
+Algorithm:
+  1. Initialise with 4 cardinal directions (±P, ±Q)
+  2. Solve OPF in each direction → boundary vertex
+  3. Find the largest gap between adjacent vertices
+  4. Insert new direction in that gap
+  5. Repeat until Δ(polygon area) < ε  (convergence)
+"""
+
+import numpy as np
+import pandas as pd
+import gurobipy as gp
+from gurobipy import GRB
+from dataclasses import dataclass, field
+from typing import List
+
+from devices import BESSModel, PVModel, ControllableLoadModel
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result container
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class FFORResult:
+    P_flex: np.ndarray   # boundary P-values [MW] (relative to baseline)
+    Q_flex: np.ndarray   # boundary Q-values [MVAr]
+    directions: np.ndarray  # (α, β) pairs used
+    converged: bool = True
+    n_iterations: int = 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Optimizer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FFOROptimizer:
+
+    def __init__(self, grid, bess_list, pv_list, load_list,
+                 n_polygon_sides: int = 8):
+        self.grid = grid
+        self.bess_list  = bess_list
+        self.pv_list    = pv_list
+        self.load_list  = load_list
+        self.n_poly     = n_polygon_sides
+
+    # ── single timestep ───────────────────────────────────────────────────────
+
+    def compute_ffor_single_timestep(self,
+                                     t_idx: int,
+                                     baseline: pd.DataFrame,
+                                     n_directions: int = 36,
+                                     tol: float = 1e-3) -> FFORResult:
+        """
+        Compute the single-timestep FFOR at timestep t_idx.
+
+        Parameters
+        ----------
+        t_idx       : index into baseline DataFrame
+        baseline    : DataFrame from grid.get_baseline()
+        n_directions: initial number of uniformly spaced directions
+        tol         : area-convergence tolerance
+        """
+        row = baseline.iloc[t_idx]
+        irr  = row.get("irradiance", 500.0)
+        temp = row.get("temperature", 10.0)
+        dt_h = 0.25   # 15-min timestep
+
+        # baseline PCC power
+        P_base_pcc = row.get("bus_0_P_base", -0.5)
+        Q_base_pcc = row.get("bus_0_Q_base", -0.05)
+
+        angles = np.linspace(0, 2 * np.pi, n_directions, endpoint=False)
+        P_pts, Q_pts = [], []
+
+        for angle in angles:
+            alpha =  np.cos(angle)   # direction weights (paper eq. 5)
+            beta  =  np.sin(angle)
+            result = self._solve_single(alpha, beta, row, irr, temp, dt_h,
+                                        P_base_pcc, Q_base_pcc)
+            if result is not None:
+                P_pts.append(result[0])
+                Q_pts.append(result[1])
+
+        if len(P_pts) == 0:
+            return FFORResult(np.array([0.0]), np.array([0.0]),
+                              angles, converged=False)
+
+        return FFORResult(
+            P_flex=np.array(P_pts),
+            Q_flex=np.array(Q_pts),
+            directions=angles,
+            n_iterations=n_directions,
+        )
+
+    def _solve_single(self, alpha: float, beta: float,
+                      row: pd.Series, irr: float, temp: float,
+                      dt_h: float, P_base_pcc: float,
+                      Q_base_pcc: float):
+        """
+        Solve one OPF for a given direction (α, β).
+        Returns (P_flex, Q_flex) at PCC or None if infeasible.
+        """
+        try:
+            m = gp.Model()
+            m.setParam("OutputFlag", 0)
+            m.setParam("TimeLimit",  30)
+
+            n = self.grid.n_buses
+            # ── decision variables ────────────────────────────────
+            # bus-level P/Q injections (flex deviations)
+            P = m.addVars(n, lb=-GRB.INFINITY, name="P")
+            Q = m.addVars(n, lb=-GRB.INFINITY, name="Q")
+
+            # PCC (slack bus) – what we optimise
+            P_pcc = m.addVar(lb=-GRB.INFINITY, name="P_pcc")
+            Q_pcc = m.addVar(lb=-GRB.INFINITY, name="Q_pcc")
+
+            # voltage angles & magnitudes (from Jacobian)
+            theta = m.addVars(n, lb=-GRB.INFINITY, name="theta")
+            dU    = m.addVars(n, lb=-GRB.INFINITY, name="dU")
+
+            # ── objective: minimise in direction (α, β) ───────────
+            # i.e., maximise flexibility in direction angle
+            m.setObjective(alpha * P_pcc + beta * Q_pcc, GRB.MINIMIZE)
+
+            # ── power-flow constraints (linearised, paper eq. 3) ──
+            J  = self.grid.J
+            Jp = J[:n, :]    # rows for P
+            Jq = J[n:, :]    # rows for Q
+
+            # reference injections at flat start
+            Pref = np.zeros(n)
+            Qref = np.zeros(n)
+            # shunt: Qref_i = -Σ b_sh_ij  (approximated as 0 here)
+
+            state = [theta[i] for i in range(n)] + [dU[i] for i in range(n)]
+
+            for i in range(n):
+                m.addConstr(
+                    P[i] == Pref[i] + gp.quicksum(
+                        J[i, j] * state[j] for j in range(2 * n)
+                    ),
+                    name=f"pf_P_{i}",
+                )
+                m.addConstr(
+                    Q[i] == Qref[i] + gp.quicksum(
+                        J[n + i, j] * state[j] for j in range(2 * n)
+                    ),
+                    name=f"pf_Q_{i}",
+                )
+
+            # slack bus: θ=0, ΔU=0 (PCC is the reference)
+            m.addConstr(theta[self.grid.pcc_bus] == 0, name="slack_theta")
+            m.addConstr(dU[self.grid.pcc_bus]    == 0, name="slack_dU")
+
+            # link PCC injection variables
+            m.addConstr(P[self.grid.pcc_bus] == P_pcc, name="pcc_P")
+            m.addConstr(Q[self.grid.pcc_bus] == Q_pcc, name="pcc_Q")
+
+            # ── voltage limits ────────────────────────────────────
+            v_min, v_max = self.grid.v_limits
+            for i in range(n):
+                m.addConstr(dU[i] >= v_min - 1.0, name=f"v_min_{i}")
+                m.addConstr(dU[i] <= v_max - 1.0, name=f"v_max_{i}")
+
+            # ── line flow limits (polygon approximation) ──────────
+            ratings = self.grid.line_ratings_mva
+            for idx, line_row in self.grid.net.line.iterrows():
+                fb = self.grid.net.bus.index.get_loc(int(line_row.from_bus))
+                tb = self.grid.net.bus.index.get_loc(int(line_row.to_bus))
+                # approximate: P_line ≈ b*(θ_f-θ_t), Q_line ≈ -b*(dU_f-dU_t)
+                bik = 1.0 / line_row.x_ohm_per_km / line_row.length_km
+                P_line = m.addVar(lb=-GRB.INFINITY, name=f"Pline_{idx}")
+                Q_line = m.addVar(lb=-GRB.INFINITY, name=f"Qline_{idx}")
+                m.addConstr(P_line == bik * (theta[fb] - theta[tb]),
+                            name=f"Pline_def_{idx}")
+                m.addConstr(Q_line == -bik * (dU[fb] - dU[tb]),
+                            name=f"Qline_def_{idx}")
+                S_max = ratings[idx]
+                n_sides = self.n_poly
+                angles_poly = np.linspace(0, 2 * np.pi, n_sides, endpoint=False)
+                for s in range(n_sides):
+                    a1, a2 = angles_poly[s], angles_poly[(s+1) % n_sides]
+                    nx = np.cos((a1 + a2) / 2)
+                    ny = np.sin((a1 + a2) / 2)
+                    rhs_val = S_max * np.cos((a2 - a1) / 2)
+                    m.addConstr(
+                        nx * P_line + ny * Q_line <= rhs_val,
+                        name=f"line_{idx}_s{s}",
+                    )
+
+            # ── device constraints ────────────────────────────────
+            # BESS
+            for bi, bess in enumerate(self.bess_list):
+                P_b = m.addVar(lb=-GRB.INFINITY, name=f"P_bess_{bi}")
+                Q_b = m.addVar(lb=-GRB.INFINITY, name=f"Q_bess_{bi}")
+                bess.add_single_timestep_constraints(m, P_b, Q_b, dt_h,
+                                                     name=f"bess_{bi}")
+                m.addConstr(P[bess.bus] == P_b, name=f"bess_{bi}_bus_P")
+                m.addConstr(Q[bess.bus] == Q_b, name=f"bess_{bi}_bus_Q")
+
+            # PV
+            for pi, pv in enumerate(self.pv_list):
+                P_p = m.addVar(lb=-GRB.INFINITY, name=f"P_pv_{pi}")
+                Q_p = m.addVar(lb=-GRB.INFINITY, name=f"Q_pv_{pi}")
+                pv.add_constraints(m, P_p, Q_p, irr, name=f"pv_{pi}")
+                # net injection = P_pv - P_load_residual
+                P_load_base = row.get(f"bus_{pv.bus}_P_hp_base", 0.3)
+                m.addConstr(P[pv.bus] == P_p - P_load_base,
+                            name=f"pv_{pi}_bus_P")
+                m.addConstr(Q[pv.bus] == Q_p, name=f"pv_{pi}_bus_Q")
+
+            # Controllable loads
+            for li, load in enumerate(self.load_list):
+                P_l = m.addVar(lb=0, name=f"P_load_{li}")
+                Q_l = m.addVar(lb=-GRB.INFINITY, name=f"Q_load_{li}")
+                P_base_l = row.get(f"bus_{load.bus}_P_hp_base", 0.3)
+                load.add_single_timestep_constraints(m, P_l, Q_l,
+                                                     P_base_l,
+                                                     name=f"load_{li}")
+
+            # ── solve ─────────────────────────────────────────────
+            m.optimize()
+
+            if m.status in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
+                P_flex = P_pcc.X - P_base_pcc
+                Q_flex = Q_pcc.X - Q_base_pcc
+                return P_flex, Q_flex
+            return None
+
+        except gp.GurobiError as e:
+            print(f"  Gurobi error: {e}")
+            return None
+
+    # ── multi-timestep ────────────────────────────────────────────────────────
+
+    def compute_ffor_multi_timestep(self,
+                                    t_start: int,
+                                    duration_h: float,
+                                    baseline: pd.DataFrame,
+                                    n_directions: int = 36) -> FFORResult:
+        """
+        Multi-timestep FFOR for a sustained duration (paper eq. 6).
+        The constant P_flex and Q_flex are the decision variables;
+        all timesteps share the same flexibility value.
+        """
+        dt_h   = 0.25
+        T      = max(1, int(duration_h / dt_h))   # number of timesteps
+        t_end  = min(t_start + T, len(baseline))
+        T      = t_end - t_start
+        rows   = [baseline.iloc[t_start + t] for t in range(T)]
+
+        P_base_pcc_series = np.array([
+            r.get("bus_0_P_base", -0.5) for r in rows
+        ])
+        Q_base_pcc_series = np.array([
+            r.get("bus_0_Q_base", -0.05) for r in rows
+        ])
+
+        angles = np.linspace(0, 2 * np.pi, n_directions, endpoint=False)
+        P_pts, Q_pts = [], []
+
+        for angle in angles:
+            alpha = np.cos(angle)
+            beta  = np.sin(angle)
+            result = self._solve_multi(alpha, beta, rows, T, dt_h,
+                                       P_base_pcc_series,
+                                       Q_base_pcc_series)
+            if result is not None:
+                P_pts.append(result[0])
+                Q_pts.append(result[1])
+
+        if len(P_pts) == 0:
+            return FFORResult(np.array([0.0]), np.array([0.0]),
+                              angles, converged=False)
+
+        return FFORResult(
+            P_flex=np.array(P_pts),
+            Q_flex=np.array(Q_pts),
+            directions=angles,
+            n_iterations=n_directions,
+        )
+
+    def _solve_multi(self, alpha, beta, rows, T, dt_h,
+                     P_base_pcc_series, Q_base_pcc_series):
+        """Single OPF solve for multi-timestep FFOR."""
+        try:
+            m = gp.Model()
+            m.setParam("OutputFlag", 0)
+            m.setParam("TimeLimit",  60)
+
+            # constant flexibility at PCC (paper eq. 6a)
+            P_flex_d = m.addVar(lb=-GRB.INFINITY, name="P_flex_d")
+            Q_flex_d = m.addVar(lb=-GRB.INFINITY, name="Q_flex_d")
+            m.setObjective(alpha * P_flex_d + beta * Q_flex_d, GRB.MINIMIZE)
+
+            n = self.grid.n_buses
+            # BESS SOC variables
+            soc_vars = {
+                bi: m.addVars(T + 1, lb=0, ub=1, name=f"soc_{bi}")
+                for bi in range(len(self.bess_list))
+            }
+            # HP temperature variables
+            T_vars = {
+                li: m.addVars(T + 1, lb=-GRB.INFINITY, name=f"Temp_{li}")
+                for li in range(len(self.load_list))
+                if self.load_list[li].type == "hp"
+            }
+
+            for t in range(T):
+                row  = rows[t]
+                irr  = row.get("irradiance", 500.0)
+                temp = row.get("temperature", 10.0)
+
+                P_t = m.addVars(n, lb=-GRB.INFINITY, name=f"P_t{t}")
+                Q_t = m.addVars(n, lb=-GRB.INFINITY, name=f"Q_t{t}")
+                theta_t = m.addVars(n, lb=-GRB.INFINITY, name=f"th_t{t}")
+                dU_t    = m.addVars(n, lb=-GRB.INFINITY, name=f"dU_t{t}")
+
+                # slack
+                m.addConstr(theta_t[self.grid.pcc_bus] == 0)
+                m.addConstr(dU_t[self.grid.pcc_bus]    == 0)
+
+                # PCC: P_t[pcc] = P_base_pcc + P_flex_d  (sustained deviation)
+                m.addConstr(P_t[self.grid.pcc_bus] == P_base_pcc_series[t] + P_flex_d,
+                            name=f"pcc_P_t{t}")
+                m.addConstr(Q_t[self.grid.pcc_bus] == Q_base_pcc_series[t] + Q_flex_d,
+                            name=f"pcc_Q_t{t}")
+
+                # linearised power flow
+                J = self.grid.J
+                state_t = [theta_t[i] for i in range(n)] + [dU_t[i] for i in range(n)]
+                for i in range(n):
+                    m.addConstr(P_t[i] == gp.quicksum(
+                        J[i, j] * state_t[j] for j in range(2 * n)))
+                    m.addConstr(Q_t[i] == gp.quicksum(
+                        J[n + i, j] * state_t[j] for j in range(2 * n)))
+
+                # voltage limits
+                v_min, v_max = self.grid.v_limits
+                for i in range(n):
+                    m.addConstr(dU_t[i] >= v_min - 1.0)
+                    m.addConstr(dU_t[i] <= v_max - 1.0)
+
+                # line limits
+                ratings = self.grid.line_ratings_mva
+                for idx, line_row in self.grid.net.line.iterrows():
+                    fb = self.grid.net.bus.index.get_loc(int(line_row.from_bus))
+                    tb = self.grid.net.bus.index.get_loc(int(line_row.to_bus))
+                    bik = 1.0 / line_row.x_ohm_per_km / line_row.length_km
+                    P_line = m.addVar(lb=-GRB.INFINITY)
+                    Q_line = m.addVar(lb=-GRB.INFINITY)
+                    m.addConstr(P_line == bik * (theta_t[fb] - theta_t[tb]))
+                    m.addConstr(Q_line == -bik * (dU_t[fb] - dU_t[tb]))
+                    S_max = ratings[idx]
+                    angles_poly = np.linspace(0, 2*np.pi, self.n_poly, endpoint=False)
+                    for s in range(self.n_poly):
+                        a1, a2 = angles_poly[s], angles_poly[(s+1) % self.n_poly]
+                        nx = np.cos((a1 + a2) / 2)
+                        ny = np.sin((a1 + a2) / 2)
+                        rhs_val = S_max * np.cos((a2 - a1) / 2)
+                        m.addConstr(nx * P_line + ny * Q_line <= rhs_val)
+
+                # BESS multi-step
+                for bi, bess in enumerate(self.bess_list):
+                    P_b = m.addVar(lb=-GRB.INFINITY)
+                    Q_b = m.addVar(lb=-GRB.INFINITY)
+                    _add_polygon = __import__(
+                        "devices", fromlist=["_add_polygon_constraint"]
+                    )._add_polygon_constraint
+                    _add_polygon(m, P_b, Q_b, bess.S_max,
+                                 n_sides=8, name_prefix=f"bess{bi}_t{t}")
+                    m.addConstr(soc_vars[bi][t] >= bess.soc_min)
+                    m.addConstr(soc_vars[bi][t] <= bess.soc_max)
+                    if t == 0:
+                        m.addConstr(soc_vars[bi][0] == bess.soc_init)
+                    m.addConstr(
+                        soc_vars[bi][t + 1] == soc_vars[bi][t]
+                        - dt_h * P_b / bess.E_cap
+                    )
+                    m.addConstr(P_t[bess.bus] == P_b)
+                    m.addConstr(Q_t[bess.bus] == Q_b)
+
+                # PV
+                for pi, pv in enumerate(self.pv_list):
+                    P_p = m.addVar(lb=0)
+                    Q_p = m.addVar(lb=-GRB.INFINITY)
+                    pv.add_constraints(m, P_p, Q_p, irr)
+                    P_load_base = row.get(f"bus_{pv.bus}_P_hp_base", 0.3)
+                    m.addConstr(P_t[pv.bus] == P_p - P_load_base)
+                    m.addConstr(Q_t[pv.bus] == Q_p)
+
+                # Heat pumps with temperature coupling
+                for li, load in enumerate(self.load_list):
+                    if load.type == "hp":
+                        P_l = m.addVar(lb=0)
+                        Q_l = m.addVar(lb=-GRB.INFINITY)
+                        P_base_l = row.get(f"bus_{load.bus}_P_hp_base", 0.3)
+                        q_heat   = max(0, (15.0 - temp) / 23.0) * P_base_l
+                        m.addConstr(P_l >= 0)
+                        m.addConstr(P_l <= load.P_max)
+                        m.addConstr(Q_l == load.tan_phi * P_l)
+                        if t == 0:
+                            m.addConstr(T_vars[li][0] == load.T_init)
+                        P_flex_l = P_l - P_base_l
+                        q_denom  = max(P_base_l, 1e-6)
+                        m.addConstr(
+                            T_vars[li][t + 1] == T_vars[li][t]
+                            + (P_flex_l / q_denom) * q_heat * dt_h
+                        )
+                        m.addConstr(T_vars[li][t] >= load.T_min)
+                        m.addConstr(T_vars[li][t] <= load.T_max)
+
+            m.optimize()
+            if m.status in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
+                return P_flex_d.X, Q_flex_d.X
+            return None
+
+        except gp.GurobiError as e:
+            print(f"  Gurobi error (multi): {e}")
+            return None
